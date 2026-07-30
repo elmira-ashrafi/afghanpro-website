@@ -1,0 +1,143 @@
+@import 'tailwindcss';
+
+@source '../../vendor/laravel/framework/src/Illuminate/Pagination/resources/views/*.blade.php';
+@source '../../storage/framework/views/*.php';
+@source '../**/*.blade.php';
+@source '../**/*.js';
+
+@theme {
+    --font-sans: 'Instrument Sans', ui-sans-serif, system-ui, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji',
+        'Segoe UI Symbol', 'Noto Color Emoji';
+}
+
+/* RTL pagination fixes */
+[dir="rtl"] .pagination {
+    flex-direction: row-reverse;
+}
+
+[dir="rtl"] .page-item:first-child .page-link {
+    border-radius: 0 0.25rem 0.25rem 0;
+    margin-left: -1px;
+}
+
+[dir="rtl"] .page-item:last-child .page-link {
+    border-radius: 0.25rem 0 0 0.25rem;
+}
+
+[dir="rtl"] .pagination-sm .page-item:first-child .page-link {
+    border-radius: 0 0.2rem 0.2rem 0;
+}
+
+[dir="rtl"] .pagination-sm .page-item:last-child .page-link {
+    border-radius: 0.2rem 0 0 0.2rem;
+}
+
+[dir="rtl"] .pagination-lg .page-item:first-child .page-link {
+    border-radius: 0 0.3rem 0.3rem 0;
+}
+
+[dir="rtl"] .pagination-lg .page-item:last-child .page-link {
+    border-radius: 0.3rem 0 0 0.3rem;
+}
+
+/* Fix for pagination icons in RTL mode */
+[dir="rtl"] .page-link[aria-label="@lang('pagination.previous')"] {
+    content: "\00BB"; /* Right arrow */
+}
+
+[dir="rtl"] .page-link[aria-label="@lang('pagination.next')"] {
+    content: "\00AB"; /* Left arrow */
+}
+
+/* Replace chevrons with better RTL-friendly versions */
+[dir="rtl"] .page-item:first-child .page-link::after {
+    content: "\25B6"; /* Right-pointing triangle */
+    display: inline-block;
+}
+
+[dir="rtl"] .page-item:first-child .page-link {
+    font-size: 0;
+}
+
+[dir="rtl"] .page-item:last-child .page-link::after {
+    content: "\25C0"; /* Left-pointing triangle */
+    display: inline-block;
+}
+
+[dir="rtl"] .page-item:last-child .page-link {
+    font-size: 0;
+}
+
+/* RTL SVG flip for Tailwind pagination */
+[dir="rtl"] .rtl-svg-flip {
+    transform: scaleX(-1);
+}
+
+/* Custom Pagination Styles - Simple Version matching screenshot */
+.pagination-simple {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    margin: 20px auto;
+    text-align: center;
+    padding-top: 15px;
+    border-top: 1px solid #eee;
+}
+
+.pagination-simple a {
+    color: #007bff;
+    text-decoration: none;
+    margin: 0 5px;
+    font-size: 14px;
+    display: inline-block;
+    min-width: 30px;
+    border-bottom: 1px solid transparent;
+}
+
+.pagination-simple a:hover {
+    border-bottom: 1px solid #007bff;
+}
+
+.pagination-simple a.prev,
+.pagination-simple a.next {
+    border-bottom: none;
+}
+
+.pagination-simple span.active {
+    color: #212529;
+    font-weight: bold;
+    margin: 0 5px;
+    min-width: 30px;
+    display: inline-block;
+    text-decoration: underline;
+}
+
+.pagination-simple span.disabled {
+    color: #ccc;
+    margin: 0 5px;
+    cursor: not-allowed;
+}
+
+.pagination-simple .prev .pagination-arrow,
+.pagination-simple .next .pagination-arrow {
+    font-size: 18px;
+    vertical-align: middle;
+}
+
+.pagination-simple .next .pagination-arrow {
+    color: #007bff;
+}
+
+.pagination-simple .dots {
+    margin: 0 5px;
+    color: #6c757d;
+}
+
+/* RTL fixes for the new pagination */
+[dir="rtl"] .pagination-simple {
+    flex-direction: row-reverse;
+}
+
+[dir="rtl"] .pagination-simple .pagination-arrow {
+    transform: scaleX(-1);
+}

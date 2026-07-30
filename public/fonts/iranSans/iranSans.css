@@ -1,0 +1,13 @@
+@font-face {
+    font-family: 'IranSans';
+    src: url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@100;200;300;400;500;600;700;800;900&display=swap');
+    font-weight: normal;
+    font-style: normal;
+}
+
+@font-face {
+    font-family: 'IranSans';
+    src: url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@700&display=swap');
+    font-weight: bold;
+    font-style: normal;
+} 

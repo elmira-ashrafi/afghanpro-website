@@ -1,0 +1,5 @@
+Name,Images,Description,ID,Parent,Type,Regular price,Categories,Tax class,Attribute 1 name,Attribute 1 value(s),Attribute 2 name,Attribute 2 value(s),Attribute 3 name,Attribute 3 value(s),Attribute 4 name,Attribute 4 value(s)
+خرید اشتراک مگا MEGA پرمیوم,https://ucarecdn.com/fdd9ad57-bff6-4f80-b1e0-fd574383b7d7/output.jpg,توضیحات محصول اینجا قرار می گیرد,1000,id:1000,variable,,اشتراک فضای ابری,,مدت زمان اشتراک,"1 ماهه (قابل تمدید) | 12 ماهه (قابل تمدید)",پلن / میزان فضا,"Pro I (2000 GB) | Pro II (8000 GB) | Pro III (16000 GB)",,,,
+خرید اشتراک مگا MEGA پرمیوم,,,,id:1000,variation,300,,parent,مدت زمان اشتراک,1 ماهه (قابل تمدید),پلن / میزان فضا,Pro I (2000 GB),,,,
+خرید اشتراک مگا MEGA پرمیوم,,,,id:1000,variation,2350,,parent,مدت زمان اشتراک,12 ماهه (قابل تمدید),پلن / میزان فضا,Pro I (2000 GB),,,,
+خرید اشتراک مگا MEGA پرمیوم,,,,id:1000,variation,500,,parent,مدت زمان اشتراک,1 ماهه (قابل تمدید),پلن / میزان فضا,Pro II (8000 GB),,,, 
