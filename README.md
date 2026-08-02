@@ -24,7 +24,7 @@
 
 ## Production Infrastructure
 
-The live deployment at [afghanpro.ashrafisolutions.com](https://afghanpro.ashrafisolutions.com) runs on a **multi-layer reverse-proxy architecture**: domains are proxied through **Cloudflare**, the host-level **Nginx** web server routes traffic by domain to isolated **Docker containers**, and each container runs **Apache on port 80** to serve PHP and execute the Laravel application.
+The live deployment at [afghanpro.ashrafisolutions.com](https://afghanpro.ashrafisolutions.com) runs on a **multi-layer reverse-proxy architecture**: domains are proxied through **Cloudflare**, the host-level **Nginx** web server routes traffic by domain to isolated **Docker containers** — each container exposing a mapped host port. The AfghanPro application specifically runs inside a container where **Apache listens on port 80** and serves PHP to execute Laravel. Other containers on the same server may run entirely different stacks (Node.js, Python, databases, etc.) without Apache.
 
 ### Architecture Overview
 
@@ -45,14 +45,13 @@ flowchart TB
         Certbot[Certbot<br/>Let's Encrypt on host]
 
         subgraph Docker["Docker Engine"]
-            subgraph ContainerA["Container: afghanpro<br/>host port → container :80"]
+            subgraph ContainerA["Container: afghanpro<br/>host :8081 → container :80"]
                 ApacheA[Apache 2.4<br/>Listens on :80]
                 PHPA[PHP 8.2 + Laravel 12]
             end
 
-            subgraph ContainerB["Container: other-domain<br/>host port → container :80"]
-                ApacheB[Apache 2.4<br/>Listens on :80]
-                PHPB[PHP Application]
+            subgraph ContainerB["Container: other-service<br/>host :8082 → container :PORT"]
+                AppB[Node.js / API / Other stack<br/>No Apache]
             end
         end
     end
@@ -61,10 +60,9 @@ flowchart TB
     HesabPay -->|Webhook POST| CFEdge
     CFEdge --> CFProxy
     CFProxy -->|Proxied request to origin| Nginx
-    Nginx -->|afghanpro.ashrafisolutions.com<br/>proxy_pass localhost:PORT_A| ApacheA
-    Nginx -->|other-domain.com<br/>proxy_pass localhost:PORT_B| ApacheB
+    Nginx -->|afghanpro.ashrafisolutions.com<br/>proxy_pass localhost:8081| ApacheA
+    Nginx -->|other-domain.com<br/>proxy_pass localhost:8082| AppB
     ApacheA --> PHPA
-    ApacheB --> PHPB
     Certbot -->|Issues & renews certs| Nginx
 ```
 
@@ -73,19 +71,19 @@ flowchart TB
 Every request passes through **three reverse-proxy layers** before reaching Laravel:
 
 ```
-┌─────────────┐     ┌──────────────────┐     ┌─────────────────────┐     ┌──────────────────────────┐
-│   Client    │────▶│    Cloudflare    │────▶│  Host Nginx         │────▶│  Docker Container        │
-│  (Browser)  │     │  Reverse Proxy   │     │  (Web Server)       │     │  Apache :80 → PHP        │
-└─────────────┘     └──────────────────┘     └─────────────────────┘     └──────────────────────────┘
-                    Proxied DNS (🟠)           Routes by domain           One container per domain
-                    CDN + DDoS + SSL           Forwards to host port      Apache executes PHP
+┌─────────────┐     ┌──────────────────┐     ┌─────────────────────┐     ┌──────────────────────────────┐
+│   Client    │────▶│    Cloudflare    │────▶│  Host Nginx         │────▶│  Docker Container            │
+│  (Browser)  │     │  Reverse Proxy   │     │  (Web Server)       │     │  (stack varies per container)│
+└─────────────┘     └──────────────────┘     └─────────────────────┘     └──────────────────────────────┘
+                    Proxied DNS (🟠)           Routes by domain           AfghanPro: Apache :80 → PHP
+                    CDN + DDoS + SSL           Forwards to host port      Others: Node, API, DB, etc.
 ```
 
 | Layer | Component | Role |
 |-------|-----------|------|
 | **1 — Edge** | Cloudflare | DNS proxy, CDN caching, DDoS mitigation, client-facing SSL/TLS |
 | **2 — Origin routing** | Nginx (host) | Virtual host per domain; forwards each domain to its container's mapped host port |
-| **3 — Application** | Docker + Apache | Isolated container per site; Apache listens on port 80 inside the container and runs PHP |
+| **3 — Application** | Docker container | Isolated runtime per service; AfghanPro uses Apache on port 80 + PHP — other containers may use a completely different stack |
 
 ---
 
@@ -133,16 +131,16 @@ Cloudflare injects headers that Nginx and Laravel rely on to identify the real c
 
 **Nginx is installed directly on the host operating system**, not inside a Docker container. It is the **origin web server** that Cloudflare connects to. Its sole job in this architecture is **domain-based routing**: receive the proxied request from Cloudflare and forward it to the correct Docker container via a **host port mapping**.
 
-This is a **multi-tenant setup** — a single Nginx instance serves multiple domains, each pointing to a different container:
+This is a **multi-tenant setup** — a single Nginx instance serves multiple domains, each pointing to a different container on its own mapped host port. Containers are independent: some run Apache + PHP, others may run Node.js, Python, or any other service entirely.
 
 ```
 Cloudflare request for afghanpro.ashrafisolutions.com
     → Host Nginx matches server_name
-    → proxy_pass http://127.0.0.1:8081   (example host port)
+    → proxy_pass http://127.0.0.1:8081   → AfghanPro container (Apache :80)
 
 Cloudflare request for another-domain.com
     → Host Nginx matches server_name
-    → proxy_pass http://127.0.0.1:8082   (different host port)
+    → proxy_pass http://127.0.0.1:8082   → Different container (may not use Apache at all)
 ```
 
 ```nginx
@@ -209,9 +207,11 @@ server {
 
 ---
 
-### Layer 3: Docker Containers with Apache
+### Layer 3: AfghanPro Docker Container (Apache + PHP)
 
-Each domain (or application) runs in its **own isolated Docker container**. Inside the container, **Apache 2.4 listens on port 80** and handles PHP execution via `mod_php` or `php-fpm` proxied through Apache — the standard LAMP stack pattern containerized.
+The AfghanPro Laravel application runs in its **own isolated Docker container**. Not every container on the server follows this pattern — only PHP/Laravel applications use Apache. Other containers on the same host may run Node.js APIs, background workers, databases, or other services with no Apache involved.
+
+**Inside the AfghanPro container**, Apache 2.4 listens on port 80 and handles PHP execution via `mod_php` or `php-fpm` proxied through Apache:
 
 ```yaml
 # docker-compose.yml (per application)
@@ -262,7 +262,7 @@ services:
 
 **Container isolation benefits:**
 
-- Each domain's PHP runtime, extensions, and Apache config are fully isolated
+- AfghanPro's PHP runtime, Apache config, and Laravel codebase are fully isolated from other services
 - A crash or misconfiguration in one container does not affect other sites on the same server
 - Containers can be independently updated, restarted, or rolled back
 - Resource limits (`--memory`, `--cpus`) can be applied per container
@@ -274,7 +274,7 @@ services:
 TLS certificates are issued on the **host Nginx** (not inside Docker containers) using **Let's Encrypt** via **Certbot**. This pairs with Cloudflare's **Full (Strict)** SSL mode — Cloudflare encrypts traffic to the client *and* to the origin server.
 
 ```
-Client ──[HTTPS/TLS]──▶ Cloudflare Edge ──[HTTPS/TLS]──▶ Host Nginx (Let's Encrypt cert) ──[HTTP]──▶ Container Apache :80
+Client ──[HTTPS/TLS]──▶ Cloudflare Edge ──[HTTPS/TLS]──▶ Host Nginx (Let's Encrypt cert) ──[HTTP]──▶ AfghanPro container (Apache :80)
 ```
 
 | SSL Mode | Client → Cloudflare | Cloudflare → Origin |
@@ -339,10 +339,10 @@ Renewal flow:
    - proxy_pass → http://127.0.0.1:8081
         │
         ▼
-5. Docker port mapping: host :8081 → container :80
+5. Docker port mapping: host :8081 → AfghanPro container :80
         │
         ▼
-6. Apache inside container receives HTTP request
+6. Apache inside the AfghanPro container receives HTTP request
    - Serves static files directly from /public
    - Rewrites dynamic routes to index.php
    - mod_php executes Laravel
