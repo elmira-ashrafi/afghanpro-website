@@ -24,7 +24,13 @@
 
 ## Production Infrastructure
 
-The live deployment at [afghanpro.ashrafisolutions.com](https://afghanpro.ashrafisolutions.com) runs on a **multi-layer reverse-proxy architecture**: domains are proxied through **Cloudflare**, the host-level **Nginx** web server routes traffic by domain to isolated **Docker containers** — each container exposing a mapped host port. The AfghanPro application specifically runs inside a container where **Apache listens on port 80** and serves PHP to execute Laravel. Other containers on the same server may run entirely different stacks (Node.js, Python, databases, etc.) without Apache.
+The live deployment at [afghanpro.ashrafisolutions.com](https://afghanpro.ashrafisolutions.com) uses a **three-layer reverse-proxy stack** to route traffic from the internet down to PHP execution inside a Docker container.
+
+| Layer | Component | Role |
+|-------|-----------|------|
+| **1 — Edge** | Cloudflare (proxied DNS) | CDN, DDoS protection, client-facing SSL; hides origin IP |
+| **2 — Origin** | Nginx on host (not in Docker) | Routes each domain to the correct container via a mapped host port |
+| **3 — Runtime** | Docker container | AfghanPro runs Apache on port 80 + PHP 8.2; other containers may use different stacks |
 
 ### Architecture Overview
 
@@ -66,330 +72,38 @@ flowchart TB
     Certbot -->|Issues & renews certs| Nginx
 ```
 
-### Request Flow (Layer by Layer)
+### Request Flow — From Browser to PHP
 
-Every request passes through **three reverse-proxy layers** before reaching Laravel:
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant CF as Cloudflare
+    participant NX as Host Nginx
+    participant DK as Docker :8081
+    participant AP as Apache :80
+    participant PHP as PHP / Laravel
 
-```
-┌─────────────┐     ┌──────────────────┐     ┌─────────────────────┐     ┌──────────────────────────────┐
-│   Client    │────▶│    Cloudflare    │────▶│  Host Nginx         │────▶│  Docker Container            │
-│  (Browser)  │     │  Reverse Proxy   │     │  (Web Server)       │     │  (stack varies per container)│
-└─────────────┘     └──────────────────┘     └─────────────────────┘     └──────────────────────────────┘
-                    Proxied DNS (🟠)           Routes by domain           AfghanPro: Apache :80 → PHP
-                    CDN + DDoS + SSL           Forwards to host port      Others: Node, API, DB, etc.
-```
-
-| Layer | Component | Role |
-|-------|-----------|------|
-| **1 — Edge** | Cloudflare | DNS proxy, CDN caching, DDoS mitigation, client-facing SSL/TLS |
-| **2 — Origin routing** | Nginx (host) | Virtual host per domain; forwards each domain to its container's mapped host port |
-| **3 — Application** | Docker container | Isolated runtime per service; AfghanPro uses Apache on port 80 + PHP — other containers may use a completely different stack |
-
----
-
-### Layer 1: Cloudflare (Proxied Domains)
-
-All production domains are configured in **Cloudflare with proxy enabled** (orange cloud icon). This means Cloudflare sits in front of the origin server as a **reverse proxy** — clients never connect directly to the server IP.
-
-**What Cloudflare handles:**
-
-| Feature | Benefit |
-|---------|---------|
-| **Proxied DNS** | Origin server IP is hidden; traffic always flows through Cloudflare's edge network |
-| **CDN caching** | Static assets (images, CSS, JS, fonts) are cached at 300+ global edge locations |
-| **DDoS protection** | Layer 3/4 and Layer 7 attack mitigation before traffic reaches the origin |
-| **SSL/TLS at edge** | Client-to-Cloudflare connection is encrypted (Flexible, Full, or Full Strict mode) |
-| **HTTP/2 & HTTP/3** | Modern protocol support at the edge without origin configuration |
-| **WAF (optional)** | Web Application Firewall rules to block malicious requests |
-
-**DNS configuration:**
-
-```
-Type    Name                              Value              Proxy
-────    ────                              ─────              ─────
-A       afghanpro.ashrafisolutions.com    <origin-server-IP>  🟠 Proxied
-CNAME   www                               afghanpro...        🟠 Proxied
+    C->>CF: HTTPS request
+    CF->>CF: CDN cache / WAF / TLS termination
+    CF->>NX: Forward to origin (CF-Connecting-IP, X-Forwarded-Proto)
+    NX->>NX: Match domain → proxy_pass localhost:8081
+    NX->>DK: HTTP via host port mapping
+    DK->>AP: Route to container port 80
+    AP->>AP: Static file or rewrite to index.php
+    AP->>PHP: Execute Laravel
+    PHP-->>AP: Blade response
+    AP-->>NX: HTTP response
+    NX-->>CF: HTTPS response
+    CF-->>C: Deliver to client
 ```
 
-With proxy enabled, Cloudflare resolves the domain to its own edge IPs — not the origin server's real IP. All inbound HTTP/HTTPS traffic is terminated at Cloudflare and re-forwarded to the origin.
+**Cloudflare** — All domains use proxied DNS (orange cloud). Traffic passes through Cloudflare's edge network for caching, DDoS mitigation, and SSL before reaching the origin. Headers like `CF-Connecting-IP` and `X-Forwarded-Proto` preserve the real client IP and HTTPS context for Laravel.
 
-**Headers forwarded to origin:**
+**Host Nginx** — Installed on the server OS, not inside Docker. A single Nginx instance handles all domains: each `server_name` block forwards requests to a different container port (e.g. `afghanpro.ashrafisolutions.com` → `127.0.0.1:8081`). SSL certificates from **Let's Encrypt / Certbot** are managed at this layer in **Full (Strict)** mode alongside Cloudflare.
 
-Cloudflare injects headers that Nginx and Laravel rely on to identify the real client and protocol:
+**Docker + Apache + PHP** — AfghanPro runs in an isolated container with port mapping `8081:80`. Inside, Apache listens on port 80, rewrites dynamic routes to `public/index.php`, and executes PHP via `mod_php`. Other containers on the same server are independent and may run entirely different stacks without Apache.
 
-| Header | Purpose |
-|--------|---------|
-| `CF-Connecting-IP` | Real client IP address (used instead of Cloudflare's edge IP) |
-| `X-Forwarded-For` | Proxy chain of client IPs |
-| `X-Forwarded-Proto` | Original protocol (`https`) — critical for Laravel `APP_URL` and secure cookies |
-| `CF-Ray` | Unique request ID for debugging across Cloudflare and origin logs |
-| `CF-Visitor` | JSON blob indicating whether the client used HTTPS |
-
----
-
-### Layer 2: Host Nginx (Reverse Proxy — Not in Docker)
-
-**Nginx is installed directly on the host operating system**, not inside a Docker container. It is the **origin web server** that Cloudflare connects to. Its sole job in this architecture is **domain-based routing**: receive the proxied request from Cloudflare and forward it to the correct Docker container via a **host port mapping**.
-
-This is a **multi-tenant setup** — a single Nginx instance serves multiple domains, each pointing to a different container on its own mapped host port. Containers are independent: some run Apache + PHP, others may run Node.js, Python, or any other service entirely.
-
-```
-Cloudflare request for afghanpro.ashrafisolutions.com
-    → Host Nginx matches server_name
-    → proxy_pass http://127.0.0.1:8081   → AfghanPro container (Apache :80)
-
-Cloudflare request for another-domain.com
-    → Host Nginx matches server_name
-    → proxy_pass http://127.0.0.1:8082   → Different container (may not use Apache at all)
-```
-
-```nginx
-# /etc/nginx/sites-available/afghanpro.ashrafisolutions.com
-# Nginx runs on the HOST — routes to Docker container via mapped port
-
-server {
-    listen 80;
-    listen [::]:80;
-    server_name afghanpro.ashrafisolutions.com;
-
-    # ACME HTTP-01 challenge for Certbot (Let's Encrypt)
-    location /.well-known/acme-challenge/ {
-        root /var/www/certbot;
-    }
-
-    location / {
-        return 301 https://$host$request_uri;
-    }
-}
-
-server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
-    server_name afghanpro.ashrafisolutions.com;
-
-    # TLS certificates issued by Certbot on the host
-    ssl_certificate     /etc/letsencrypt/live/afghanpro.ashrafisolutions.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/afghanpro.ashrafisolutions.com/privkey.pem;
-
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers off;
-
-    # Trust Cloudflare IPs for real client IP resolution
-    set_real_ip_from 173.245.48.0/20;
-    set_real_ip_from 103.21.244.0/22;
-    # ... (all Cloudflare IP ranges)
-    real_ip_header CF-Connecting-IP;
-
-    client_max_body_size 32M;
-
-    # Forward entire request to the Docker container's mapped host port
-    # Container internally runs Apache on port 80
-    location / {
-        proxy_pass         http://127.0.0.1:8081;
-        proxy_http_version 1.1;
-        proxy_set_header   Host              $host;
-        proxy_set_header   X-Real-IP         $remote_addr;
-        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
-        proxy_set_header   Upgrade           $http_upgrade;
-        proxy_set_header   Connection        "upgrade";
-        proxy_read_timeout 300;
-    }
-}
-```
-
-**Why Nginx is on the host and not in Docker:**
-
-- A **single Nginx** can route dozens of domains to dozens of containers without running a separate Nginx per container
-- **SSL certificates** are managed once on the host via Certbot — not duplicated inside every container
-- **Port 80/443** are bound only on the host; containers expose arbitrary high ports (8081, 8082, …) mapped via Docker's `-p` flag
-- Adding a new site = new container + new Nginx `server` block — no changes to existing containers
-
----
-
-### Layer 3: AfghanPro Docker Container (Apache + PHP)
-
-The AfghanPro Laravel application runs in its **own isolated Docker container**. Not every container on the server follows this pattern — only PHP/Laravel applications use Apache. Other containers on the same host may run Node.js APIs, background workers, databases, or other services with no Apache involved.
-
-**Inside the AfghanPro container**, Apache 2.4 listens on port 80 and handles PHP execution via `mod_php` or `php-fpm` proxied through Apache:
-
-```yaml
-# docker-compose.yml (per application)
-services:
-  afghanpro:
-    image: php:8.2-apache          # Apache + PHP in one image
-    container_name: afghanpro
-    ports:
-      - "8081:80"                  # Host port 8081 → Container port 80
-    volumes:
-      - ./:/var/www/html
-    environment:
-      - APACHE_DOCUMENT_ROOT=/var/www/html/public
-    restart: unless-stopped
-```
-
-**Inside the container:**
-
-| Component | Details |
-|-----------|---------|
-| **Apache** | Listens on port 80 inside the container; serves as the web server and PHP handler |
-| **PHP 8.2** | Executes Laravel via Apache's `mod_php` or `proxy:fcgi` to PHP-FPM |
-| **Document root** | `/var/www/html/public` — Laravel's front-controller entry point |
-| **Port mapping** | `8081:80` — only this host port is exposed; Apache is never directly reachable from the internet |
-
-```apache
-# Apache VirtualHost inside the container
-<VirtualHost *:80>
-    DocumentRoot /var/www/html/public
-
-    <Directory /var/www/html/public>
-        AllowOverride All
-        Require all granted
-    </Directory>
-
-    # Laravel front-controller rewrite
-    <IfModule mod_rewrite.c>
-        RewriteEngine On
-        RewriteCond %{REQUEST_FILENAME} !-d
-        RewriteCond %{REQUEST_FILENAME} !-f
-        RewriteRule ^ index.php [L]
-    </IfModule>
-
-    ErrorLog ${APACHE_LOG_DIR}/error.log
-    CustomLog ${APACHE_LOG_DIR}/access.log combined
-</VirtualHost>
-```
-
-**Container isolation benefits:**
-
-- AfghanPro's PHP runtime, Apache config, and Laravel codebase are fully isolated from other services
-- A crash or misconfiguration in one container does not affect other sites on the same server
-- Containers can be independently updated, restarted, or rolled back
-- Resource limits (`--memory`, `--cpus`) can be applied per container
-
----
-
-### SSL/TLS with Let's Encrypt & Certbot (Host-Level)
-
-TLS certificates are issued on the **host Nginx** (not inside Docker containers) using **Let's Encrypt** via **Certbot**. This pairs with Cloudflare's **Full (Strict)** SSL mode — Cloudflare encrypts traffic to the client *and* to the origin server.
-
-```
-Client ──[HTTPS/TLS]──▶ Cloudflare Edge ──[HTTPS/TLS]──▶ Host Nginx (Let's Encrypt cert) ──[HTTP]──▶ AfghanPro container (Apache :80)
-```
-
-| SSL Mode | Client → Cloudflare | Cloudflare → Origin |
-|----------|--------------------|--------------------|
-| Flexible | HTTPS | HTTP (not recommended) |
-| Full | HTTPS | HTTPS (self-signed origin cert accepted) |
-| **Full (Strict)** | HTTPS | HTTPS (valid Let's Encrypt origin cert required) |
-
-**Initial certificate provisioning (on the host):**
-
-```bash
-# Run on the host OS (not inside Docker)
-certbot certonly \
-  --webroot \
-  --webroot-path=/var/www/certbot \
-  --email elmiraashrafiiii@gmail.com \
-  --agree-tos \
-  --no-eff-email \
-  -d afghanpro.ashrafisolutions.com
-```
-
-**Automated renewal (host cron):**
-
-```bash
-# /etc/cron.d/certbot — runs twice daily on the host
-0 3,15 * * * certbot renew --quiet --deploy-hook "systemctl reload nginx"
-```
-
-Renewal flow:
-
-1. Certbot checks if the certificate expires within 30 days
-2. HTTP-01 ACME challenge is served by host Nginx via `/.well-known/acme-challenge/`
-3. Let's Encrypt validates domain ownership and issues a new certificate
-4. Certbot replaces certs at `/etc/letsencrypt/live/` (atomic symlink swap)
-5. `systemctl reload nginx` loads new certs **without dropping active connections**
-
-**Cloudflare + Let's Encrypt interaction:**
-
-- Cloudflare proxy must be **temporarily disabled** (grey cloud) during initial certificate issuance, OR use **DNS-01 challenge** via Cloudflare API to avoid this
-- Once issued, re-enable Cloudflare proxy (orange cloud) and set SSL mode to **Full (Strict)**
-- Cloudflare's **Origin CA** certificates are an alternative to Let's Encrypt for origin encryption
-
----
-
-### End-to-End Request Lifecycle
-
-```
-1. User visits https://afghanpro.ashrafisolutions.com
-        │
-        ▼
-2. DNS resolves to Cloudflare edge IP (proxied / orange cloud)
-        │
-        ▼
-3. Cloudflare terminates client TLS, applies WAF/CDN rules,
-   forwards request to origin server IP on port 443
-   (injects CF-Connecting-IP, X-Forwarded-Proto headers)
-        │
-        ▼
-4. Host Nginx receives HTTPS request
-   - Matches server_name: afghanpro.ashrafisolutions.com
-   - Decrypts TLS using Let's Encrypt certificate
-   - proxy_pass → http://127.0.0.1:8081
-        │
-        ▼
-5. Docker port mapping: host :8081 → AfghanPro container :80
-        │
-        ▼
-6. Apache inside the AfghanPro container receives HTTP request
-   - Serves static files directly from /public
-   - Rewrites dynamic routes to index.php
-   - mod_php executes Laravel
-        │
-        ▼
-7. Laravel handles request
-   - Middleware pipeline (auth, CSRF, session)
-   - Controller logic (wallet, shop, HesabPay callback)
-   - Database queries, cache reads, queue dispatch
-   - Blade view rendered
-        │
-        ▼
-8. Response travels back:
-   Apache → Host Nginx → Cloudflare Edge → Client
-```
-
-**HesabPay payment callbacks** (`POST /hesabpay/webhook`, `GET /hesabpay/callback`) follow the same path. Laravel reads `X-Forwarded-Proto: https` to generate correct HTTPS URLs and uses `CF-Connecting-IP` for accurate client logging behind both Cloudflare and Nginx.
-
----
-
-### Deployment Workflow
-
-```bash
-# 1. Pull latest code into the project directory
-cd /var/www/afghanpro && git pull origin main
-
-# 2. Enter the Docker container
-docker exec -it afghanpro bash
-
-# 3. Install dependencies & run migrations
-composer install --no-dev --optimize-autoloader
-php artisan migrate --force
-
-# 4. Cache Laravel for production
-php artisan config:cache
-php artisan route:cache
-php artisan view:cache
-
-# 5. Build frontend assets
-npm ci && npm run build
-
-# 6. Restart the container to apply changes
-docker restart afghanpro
-
-# 7. Verify through the full stack
-curl -f https://afghanpro.ashrafisolutions.com/up
-```
+HesabPay webhooks and payment callbacks follow the same path end-to-end. Laravel relies on `X-Forwarded-Proto` for secure URL generation behind both Cloudflare and Nginx.
 
 ---
 
