@@ -24,7 +24,7 @@
 
 ## Production Infrastructure
 
-The live deployment at [afghanpro.ashrafisolutions.com](https://afghanpro.ashrafisolutions.com) runs on a **containerized, reverse-proxied stack** designed for production-grade Laravel hosting: isolated services via Docker, HTTP/HTTPS termination and routing via Nginx, and automated TLS certificate lifecycle management through **Let's Encrypt** and **Certbot**.
+The live deployment at [afghanpro.ashrafisolutions.com](https://afghanpro.ashrafisolutions.com) runs on a **multi-layer reverse-proxy architecture**: domains are proxied through **Cloudflare**, the host-level **Nginx** web server routes traffic by domain to isolated **Docker containers**, and each container runs **Apache on port 80** to serve PHP and execute the Laravel application.
 
 ### Architecture Overview
 
@@ -35,111 +35,126 @@ flowchart TB
         HesabPay[HesabPay API & Webhooks]
     end
 
-    subgraph Host["Production Host (Docker)"]
-        subgraph Edge["Edge Layer"]
-            Nginx[Nginx Reverse Proxy<br/>:80 / :443]
-            Certbot[Certbot<br/>Let's Encrypt]
-        end
+    subgraph Cloudflare["Cloudflare (Proxied DNS — Orange Cloud)"]
+        CFEdge[Cloudflare Edge Network<br/>CDN · DDoS Protection · SSL]
+        CFProxy[Reverse Proxy<br/>Hides origin IP]
+    end
 
-        subgraph App["Application Layer"]
-            PHPFPM[PHP-FPM 8.2<br/>Laravel 12]
-            Queue[Laravel Queue Worker]
-            Scheduler[Laravel Scheduler]
-        end
+    subgraph Host["Production Server (Host OS)"]
+        Nginx[Nginx Web Server<br/>Host-level · NOT in Docker<br/>:80 / :443]
+        Certbot[Certbot<br/>Let's Encrypt on host]
 
-        subgraph Data["Data Layer"]
-            DB[(MySQL / MariaDB)]
-            Redis[(Redis<br/>Cache & Sessions)]
+        subgraph Docker["Docker Engine"]
+            subgraph ContainerA["Container: afghanpro<br/>host port → container :80"]
+                ApacheA[Apache 2.4<br/>Listens on :80]
+                PHPA[PHP 8.2 + Laravel 12]
+            end
+
+            subgraph ContainerB["Container: other-domain<br/>host port → container :80"]
+                ApacheB[Apache 2.4<br/>Listens on :80]
+                PHPB[PHP Application]
+            end
         end
     end
 
-    Client -->|HTTPS TLS 1.2/1.3| Nginx
-    HesabPay -->|Webhook POST /hesabpay/webhook| Nginx
-    Nginx -->|FastCGI :9000| PHPFPM
-    Nginx -->|Static assets /public| PHPFPM
-    PHPFPM --> DB
-    PHPFPM --> Redis
-    Queue --> DB
-    Queue --> Redis
-    Certbot -->|ACME challenge & cert renewal| Nginx
-    Certbot -->|Deploy certs to /etc/letsencrypt| Nginx
+    Client -->|HTTPS| CFEdge
+    HesabPay -->|Webhook POST| CFEdge
+    CFEdge --> CFProxy
+    CFProxy -->|Proxied request to origin| Nginx
+    Nginx -->|afghanpro.ashrafisolutions.com<br/>proxy_pass localhost:PORT_A| ApacheA
+    Nginx -->|other-domain.com<br/>proxy_pass localhost:PORT_B| ApacheB
+    ApacheA --> PHPA
+    ApacheB --> PHPB
+    Certbot -->|Issues & renews certs| Nginx
 ```
 
-### Docker Containerization
+### Request Flow (Layer by Layer)
 
-The application is decomposed into **single-responsibility containers** orchestrated with Docker Compose. Each service runs in an isolated namespace with its own filesystem, network interface, and resource limits — improving reproducibility, rollback safety, and environment parity between staging and production.
+Every request passes through **three reverse-proxy layers** before reaching Laravel:
 
-| Container | Role | Responsibility |
-|-----------|------|----------------|
-| **nginx** | Reverse proxy & web server | Terminates TLS, serves static files, routes requests to PHP-FPM, enforces security headers |
-| **php-fpm** | Application runtime | Executes Laravel via FastCGI; runs `artisan` commands during deploy |
-| **mysql** (or **mariadb**) | Primary datastore | Persistent relational storage for users, wallets, orders, transactions |
-| **redis** | In-memory store | Session storage, cache layer, queue backend for async jobs |
-| **queue-worker** | Background processor | Runs `php artisan queue:work` for payment callbacks, notifications |
-| **scheduler** | Cron replacement | Executes `php artisan schedule:run` every minute via container cron |
-| **certbot** | Certificate manager | Obtains and renews Let's Encrypt certificates; reloads Nginx on success |
-
-**Key design decisions:**
-
-- **Immutable application image** — The PHP-FPM image is built from a `Dockerfile` with pinned PHP extensions (`pdo_mysql`, `mbstring`, `openssl`, `bcmath`, `gd`, `zip`, `intl`) required by Laravel and payment integrations.
-- **Volume-mounted persistence** — Database data, Redis snapshots, Laravel `storage/` (uploads, logs), and Let's Encrypt certificates are stored on named Docker volumes so containers can be recreated without data loss.
-- **Internal bridge network** — Containers communicate over a private Docker network (`app-network`). Only Nginx exposes ports `80` and `443` to the host; PHP-FPM and the database are not reachable from the public internet.
-- **Environment injection** — Production secrets (`APP_KEY`, `HESABPAY_API_KEY`, database credentials) are injected via `.env` mounted as a read-only volume or Docker secrets — never baked into the image.
-
-```yaml
-# Simplified docker-compose service topology
-services:
-  nginx:
-    image: nginx:alpine
-    ports: ["80:80", "443:443"]
-    volumes:
-      - ./nginx/conf.d:/etc/nginx/conf.d:ro
-      - ./public:/var/www/html/public:ro
-      - certbot-certs:/etc/letsencrypt:ro
-    depends_on: [php-fpm]
-
-  php-fpm:
-    build: ./docker/php
-    volumes:
-      - .:/var/www/html
-    depends_on: [mysql, redis]
-
-  mysql:
-    image: mysql:8.0
-    volumes: [db-data:/var/lib/mysql]
-
-  redis:
-    image: redis:alpine
-
-  queue-worker:
-    build: ./docker/php
-    command: php artisan queue:work --sleep=3 --tries=3
-
-  certbot:
-    image: certbot/certbot
-    volumes:
-      - certbot-certs:/etc/letsencrypt
-      - certbot-webroot:/var/www/certbot
+```
+┌─────────────┐     ┌──────────────────┐     ┌─────────────────────┐     ┌──────────────────────────┐
+│   Client    │────▶│    Cloudflare    │────▶│  Host Nginx         │────▶│  Docker Container        │
+│  (Browser)  │     │  Reverse Proxy   │     │  (Web Server)       │     │  Apache :80 → PHP        │
+└─────────────┘     └──────────────────┘     └─────────────────────┘     └──────────────────────────┘
+                    Proxied DNS (🟠)           Routes by domain           One container per domain
+                    CDN + DDoS + SSL           Forwards to host port      Apache executes PHP
 ```
 
-### Nginx Reverse Proxy Configuration
+| Layer | Component | Role |
+|-------|-----------|------|
+| **1 — Edge** | Cloudflare | DNS proxy, CDN caching, DDoS mitigation, client-facing SSL/TLS |
+| **2 — Origin routing** | Nginx (host) | Virtual host per domain; forwards each domain to its container's mapped host port |
+| **3 — Application** | Docker + Apache | Isolated container per site; Apache listens on port 80 inside the container and runs PHP |
 
-Nginx acts as the **sole entry point** for all inbound traffic. It handles three distinct responsibilities that PHP-FPM should never perform directly in production:
+---
 
-1. **TLS termination** — Decrypts HTTPS before forwarding to upstream services
-2. **Static asset delivery** — Serves files from `public/` (images, fonts, compiled CSS/JS) directly without invoking PHP
-3. **Front-controller routing** — Rewrites all dynamic requests to `public/index.php` (Laravel's single entry point)
+### Layer 1: Cloudflare (Proxied Domains)
+
+All production domains are configured in **Cloudflare with proxy enabled** (orange cloud icon). This means Cloudflare sits in front of the origin server as a **reverse proxy** — clients never connect directly to the server IP.
+
+**What Cloudflare handles:**
+
+| Feature | Benefit |
+|---------|---------|
+| **Proxied DNS** | Origin server IP is hidden; traffic always flows through Cloudflare's edge network |
+| **CDN caching** | Static assets (images, CSS, JS, fonts) are cached at 300+ global edge locations |
+| **DDoS protection** | Layer 3/4 and Layer 7 attack mitigation before traffic reaches the origin |
+| **SSL/TLS at edge** | Client-to-Cloudflare connection is encrypted (Flexible, Full, or Full Strict mode) |
+| **HTTP/2 & HTTP/3** | Modern protocol support at the edge without origin configuration |
+| **WAF (optional)** | Web Application Firewall rules to block malicious requests |
+
+**DNS configuration:**
+
+```
+Type    Name                              Value              Proxy
+────    ────                              ─────              ─────
+A       afghanpro.ashrafisolutions.com    <origin-server-IP>  🟠 Proxied
+CNAME   www                               afghanpro...        🟠 Proxied
+```
+
+With proxy enabled, Cloudflare resolves the domain to its own edge IPs — not the origin server's real IP. All inbound HTTP/HTTPS traffic is terminated at Cloudflare and re-forwarded to the origin.
+
+**Headers forwarded to origin:**
+
+Cloudflare injects headers that Nginx and Laravel rely on to identify the real client and protocol:
+
+| Header | Purpose |
+|--------|---------|
+| `CF-Connecting-IP` | Real client IP address (used instead of Cloudflare's edge IP) |
+| `X-Forwarded-For` | Proxy chain of client IPs |
+| `X-Forwarded-Proto` | Original protocol (`https`) — critical for Laravel `APP_URL` and secure cookies |
+| `CF-Ray` | Unique request ID for debugging across Cloudflare and origin logs |
+| `CF-Visitor` | JSON blob indicating whether the client used HTTPS |
+
+---
+
+### Layer 2: Host Nginx (Reverse Proxy — Not in Docker)
+
+**Nginx is installed directly on the host operating system**, not inside a Docker container. It is the **origin web server** that Cloudflare connects to. Its sole job in this architecture is **domain-based routing**: receive the proxied request from Cloudflare and forward it to the correct Docker container via a **host port mapping**.
+
+This is a **multi-tenant setup** — a single Nginx instance serves multiple domains, each pointing to a different container:
+
+```
+Cloudflare request for afghanpro.ashrafisolutions.com
+    → Host Nginx matches server_name
+    → proxy_pass http://127.0.0.1:8081   (example host port)
+
+Cloudflare request for another-domain.com
+    → Host Nginx matches server_name
+    → proxy_pass http://127.0.0.1:8082   (different host port)
+```
 
 ```nginx
-# /etc/nginx/conf.d/afghanpro.conf (production)
+# /etc/nginx/sites-available/afghanpro.ashrafisolutions.com
+# Nginx runs on the HOST — routes to Docker container via mapped port
 
-# HTTP → HTTPS redirect
 server {
     listen 80;
     listen [::]:80;
     server_name afghanpro.ashrafisolutions.com;
 
-    # ACME HTTP-01 challenge (used by Certbot)
+    # ACME HTTP-01 challenge for Certbot (Let's Encrypt)
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
     }
@@ -149,89 +164,130 @@ server {
     }
 }
 
-# HTTPS — primary server block
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
     server_name afghanpro.ashrafisolutions.com;
 
-    root /var/www/html/public;
-    index index.php;
-
-    # TLS certificates (managed by Certbot)
+    # TLS certificates issued by Certbot on the host
     ssl_certificate     /etc/letsencrypt/live/afghanpro.ashrafisolutions.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/afghanpro.ashrafisolutions.com/privkey.pem;
-    ssl_trusted_certificate /etc/letsencrypt/live/afghanpro.ashrafisolutions.com/chain.pem;
 
-    # Modern TLS configuration
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
     ssl_prefer_server_ciphers off;
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 1d;
-    ssl_session_tickets off;
 
-    # Security headers
-    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
-    add_header X-Frame-Options "SAMEORIGIN" always;
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    # Trust Cloudflare IPs for real client IP resolution
+    set_real_ip_from 173.245.48.0/20;
+    set_real_ip_from 103.21.244.0/22;
+    # ... (all Cloudflare IP ranges)
+    real_ip_header CF-Connecting-IP;
 
-    # Gzip compression
-    gzip on;
-    gzip_types text/plain text/css application/json application/javascript text/xml application/xml;
-
-    # Max upload size (product images, CSV imports)
     client_max_body_size 32M;
 
-    # Laravel front-controller pattern
+    # Forward entire request to the Docker container's mapped host port
+    # Container internally runs Apache on port 80
     location / {
-        try_files $uri $uri/ /index.php?$query_string;
-    }
-
-    # PHP-FPM upstream via Docker internal network
-    location ~ \.php$ {
-        fastcgi_pass php-fpm:9000;
-        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
-        include fastcgi_params;
-        fastcgi_hide_header X-Powered-By;
-        fastcgi_read_timeout 300;
-    }
-
-    # Deny access to hidden files (.env, .git)
-    location ~ /\.(?!well-known).* {
-        deny all;
-    }
-
-    # Cache static assets aggressively
-    location ~* \.(jpg|jpeg|png|gif|ico|css|js|webp|woff2|svg)$ {
-        expires 30d;
-        add_header Cache-Control "public, immutable";
-        access_log off;
+        proxy_pass         http://127.0.0.1:8081;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   Upgrade           $http_upgrade;
+        proxy_set_header   Connection        "upgrade";
+        proxy_read_timeout 300;
     }
 }
 ```
 
-**HesabPay webhook handling:** Payment gateway callbacks (`POST /hesabpay/webhook`) and redirect URLs (`/hesabpay/callback`, `/payment/success`, `/payment/fail`) are routed through the same Nginx → PHP-FPM pipeline. Nginx preserves the original `X-Forwarded-Proto` and `X-Forwarded-For` headers so Laravel correctly generates HTTPS URLs and logs client IPs behind the proxy.
+**Why Nginx is on the host and not in Docker:**
 
-### SSL/TLS with Let's Encrypt & Certbot
+- A **single Nginx** can route dozens of domains to dozens of containers without running a separate Nginx per container
+- **SSL certificates** are managed once on the host via Certbot — not duplicated inside every container
+- **Port 80/443** are bound only on the host; containers expose arbitrary high ports (8081, 8082, …) mapped via Docker's `-p` flag
+- Adding a new site = new container + new Nginx `server` block — no changes to existing containers
 
-All traffic to the production domain is encrypted with **free, auto-renewing TLS certificates** issued by [Let's Encrypt](https://letsencrypt.org) via [Certbot](https://certbot.eff.org). This eliminates manual certificate management and ensures the platform maintains an A-grade SSL configuration.
+---
 
-#### Initial Certificate Provisioning
+### Layer 3: Docker Containers with Apache
 
-Certbot uses the **HTTP-01 ACME challenge** during first-time setup:
+Each domain (or application) runs in its **own isolated Docker container**. Inside the container, **Apache 2.4 listens on port 80** and handles PHP execution via `mod_php` or `php-fpm` proxied through Apache — the standard LAMP stack pattern containerized.
 
-1. Certbot requests a certificate for `afghanpro.ashrafisolutions.com` from the Let's Encrypt CA
-2. The CA responds with a challenge token
-3. Certbot writes the token to `/var/www/certbot/.well-known/acme-challenge/`
-4. Nginx serves this path on port 80 (the dedicated `location` block above)
-5. The CA verifies domain ownership over HTTP and issues the certificate
-6. Certbot stores the certificate chain at `/etc/letsencrypt/live/afghanpro.ashrafisolutions.com/`
+```yaml
+# docker-compose.yml (per application)
+services:
+  afghanpro:
+    image: php:8.2-apache          # Apache + PHP in one image
+    container_name: afghanpro
+    ports:
+      - "8081:80"                  # Host port 8081 → Container port 80
+    volumes:
+      - ./:/var/www/html
+    environment:
+      - APACHE_DOCUMENT_ROOT=/var/www/html/public
+    restart: unless-stopped
+```
+
+**Inside the container:**
+
+| Component | Details |
+|-----------|---------|
+| **Apache** | Listens on port 80 inside the container; serves as the web server and PHP handler |
+| **PHP 8.2** | Executes Laravel via Apache's `mod_php` or `proxy:fcgi` to PHP-FPM |
+| **Document root** | `/var/www/html/public` — Laravel's front-controller entry point |
+| **Port mapping** | `8081:80` — only this host port is exposed; Apache is never directly reachable from the internet |
+
+```apache
+# Apache VirtualHost inside the container
+<VirtualHost *:80>
+    DocumentRoot /var/www/html/public
+
+    <Directory /var/www/html/public>
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    # Laravel front-controller rewrite
+    <IfModule mod_rewrite.c>
+        RewriteEngine On
+        RewriteCond %{REQUEST_FILENAME} !-d
+        RewriteCond %{REQUEST_FILENAME} !-f
+        RewriteRule ^ index.php [L]
+    </IfModule>
+
+    ErrorLog ${APACHE_LOG_DIR}/error.log
+    CustomLog ${APACHE_LOG_DIR}/access.log combined
+</VirtualHost>
+```
+
+**Container isolation benefits:**
+
+- Each domain's PHP runtime, extensions, and Apache config are fully isolated
+- A crash or misconfiguration in one container does not affect other sites on the same server
+- Containers can be independently updated, restarted, or rolled back
+- Resource limits (`--memory`, `--cpus`) can be applied per container
+
+---
+
+### SSL/TLS with Let's Encrypt & Certbot (Host-Level)
+
+TLS certificates are issued on the **host Nginx** (not inside Docker containers) using **Let's Encrypt** via **Certbot**. This pairs with Cloudflare's **Full (Strict)** SSL mode — Cloudflare encrypts traffic to the client *and* to the origin server.
+
+```
+Client ──[HTTPS/TLS]──▶ Cloudflare Edge ──[HTTPS/TLS]──▶ Host Nginx (Let's Encrypt cert) ──[HTTP]──▶ Container Apache :80
+```
+
+| SSL Mode | Client → Cloudflare | Cloudflare → Origin |
+|----------|--------------------|--------------------|
+| Flexible | HTTPS | HTTP (not recommended) |
+| Full | HTTPS | HTTPS (self-signed origin cert accepted) |
+| **Full (Strict)** | HTTPS | HTTPS (valid Let's Encrypt origin cert required) |
+
+**Initial certificate provisioning (on the host):**
 
 ```bash
-# Initial certificate issuance (run once)
-docker compose run --rm certbot certonly \
+# Run on the host OS (not inside Docker)
+certbot certonly \
   --webroot \
   --webroot-path=/var/www/certbot \
   --email elmiraashrafiiii@gmail.com \
@@ -240,88 +296,98 @@ docker compose run --rm certbot certonly \
   -d afghanpro.ashrafisolutions.com
 ```
 
-#### Automated Renewal
-
-Let's Encrypt certificates expire every **90 days**. Certbot handles renewal automatically via a scheduled job:
+**Automated renewal (host cron):**
 
 ```bash
-# Cron entry on the host (runs twice daily)
-0 3,15 * * * docker compose run --rm certbot renew --quiet \
-  && docker compose exec nginx nginx -s reload
+# /etc/cron.d/certbot — runs twice daily on the host
+0 3,15 * * * certbot renew --quiet --deploy-hook "systemctl reload nginx"
 ```
 
-The renewal process:
+Renewal flow:
 
-1. **Certbot checks expiry** — If the certificate has fewer than 30 days remaining, renewal is triggered
-2. **ACME challenge repeats** — Same HTTP-01 flow validates continued domain control
-3. **Certificate replaced in-place** — New certs are written to `/etc/letsencrypt/live/` (symlinks updated atomically)
-4. **Nginx graceful reload** — `nginx -s reload` loads the new certificates **without dropping active connections** — critical for a financial platform with ongoing payment sessions
+1. Certbot checks if the certificate expires within 30 days
+2. HTTP-01 ACME challenge is served by host Nginx via `/.well-known/acme-challenge/`
+3. Let's Encrypt validates domain ownership and issues a new certificate
+4. Certbot replaces certs at `/etc/letsencrypt/live/` (atomic symlink swap)
+5. `systemctl reload nginx` loads new certs **without dropping active connections**
 
-#### TLS Security Posture
+**Cloudflare + Let's Encrypt interaction:**
 
-| Property | Configuration |
-|----------|---------------|
-| **Protocols** | TLS 1.2 and TLS 1.3 only (TLS 1.0/1.1 disabled) |
-| **Cipher suites** | ECDHE forward-secrecy ciphers with AES-GCM |
-| **HSTS** | `max-age=63072000` (2 years) with `includeSubDomains` |
-| **OCSP Stapling** | Enabled via `ssl_trusted_certificate` for faster handshake validation |
-| **HTTP → HTTPS** | Permanent 301 redirect on port 80 |
-| **Certificate authority** | Let's Encrypt (ISRG Root X1) — trusted by all major browsers |
+- Cloudflare proxy must be **temporarily disabled** (grey cloud) during initial certificate issuance, OR use **DNS-01 challenge** via Cloudflare API to avoid this
+- Once issued, re-enable Cloudflare proxy (orange cloud) and set SSL mode to **Full (Strict)**
+- Cloudflare's **Origin CA** certificates are an alternative to Let's Encrypt for origin encryption
 
-### Request Lifecycle (End-to-End)
+---
+
+### End-to-End Request Lifecycle
 
 ```
-Client HTTPS request
-    │
-    ▼
-Nginx :443 — TLS decryption, security headers, static file check
-    │
-    ├── Static asset? → Serve from /public (cached 30 days)
-    │
-    └── Dynamic route? → FastCGI pass to php-fpm:9000
-            │
-            ▼
-        Laravel Kernel → Middleware pipeline → Controller
-            │
-            ├── Database query (MySQL via PDO)
-            ├── Cache read/write (Redis)
-            ├── HesabPay API call (outbound HTTPS)
-            └── Queue job dispatch (async processing)
-            │
-            ▼
-        Blade view rendered → Response
-    │
-    ▼
-Nginx — Gzip compression → Encrypted HTTPS response → Client
+1. User visits https://afghanpro.ashrafisolutions.com
+        │
+        ▼
+2. DNS resolves to Cloudflare edge IP (proxied / orange cloud)
+        │
+        ▼
+3. Cloudflare terminates client TLS, applies WAF/CDN rules,
+   forwards request to origin server IP on port 443
+   (injects CF-Connecting-IP, X-Forwarded-Proto headers)
+        │
+        ▼
+4. Host Nginx receives HTTPS request
+   - Matches server_name: afghanpro.ashrafisolutions.com
+   - Decrypts TLS using Let's Encrypt certificate
+   - proxy_pass → http://127.0.0.1:8081
+        │
+        ▼
+5. Docker port mapping: host :8081 → container :80
+        │
+        ▼
+6. Apache inside container receives HTTP request
+   - Serves static files directly from /public
+   - Rewrites dynamic routes to index.php
+   - mod_php executes Laravel
+        │
+        ▼
+7. Laravel handles request
+   - Middleware pipeline (auth, CSRF, session)
+   - Controller logic (wallet, shop, HesabPay callback)
+   - Database queries, cache reads, queue dispatch
+   - Blade view rendered
+        │
+        ▼
+8. Response travels back:
+   Apache → Host Nginx → Cloudflare Edge → Client
 ```
+
+**HesabPay payment callbacks** (`POST /hesabpay/webhook`, `GET /hesabpay/callback`) follow the same path. Laravel reads `X-Forwarded-Proto: https` to generate correct HTTPS URLs and uses `CF-Connecting-IP` for accurate client logging behind both Cloudflare and Nginx.
+
+---
 
 ### Deployment Workflow
 
-Production deployments follow a zero-downtime rolling update pattern:
-
 ```bash
-# 1. Pull latest code
-git pull origin main
+# 1. Pull latest code into the project directory
+cd /var/www/afghanpro && git pull origin main
 
-# 2. Rebuild PHP image if Dockerfile changed
-docker compose build php-fpm
+# 2. Enter the Docker container
+docker exec -it afghanpro bash
 
-# 3. Install dependencies & run migrations inside the container
-docker compose exec php-fpm composer install --no-dev --optimize-autoloader
-docker compose exec php-fpm php artisan migrate --force
+# 3. Install dependencies & run migrations
+composer install --no-dev --optimize-autoloader
+php artisan migrate --force
 
-# 4. Cache Laravel configuration for production performance
-docker compose exec php-fpm php artisan config:cache
-docker compose exec php-fpm php artisan route:cache
-docker compose exec php-fpm php artisan view:cache
+# 4. Cache Laravel for production
+php artisan config:cache
+php artisan route:cache
+php artisan view:cache
 
 # 5. Build frontend assets
-docker compose exec php-fpm npm ci && npm run build
+npm ci && npm run build
 
-# 6. Restart workers to pick up new code
-docker compose restart php-fpm queue-worker
+# 6. Restart the container to apply changes
+docker restart afghanpro
 
-# 7. Verify health endpoint
+# 7. Verify through the full stack
 curl -f https://afghanpro.ashrafisolutions.com/up
 ```
 
@@ -480,21 +546,21 @@ afghanpro-website/
 2. **Install PHP dependencies**
 
    ```bash
-   composer install
-   ```
+composer install
+```
 
 3. **Install Node dependencies**
 
    ```bash
    npm install
-   ```
+```
 
 4. **Configure environment**
 
    ```bash
-   cp .env.example .env
-   php artisan key:generate
-   ```
+cp .env.example .env
+php artisan key:generate
+```
 
 5. **Create the SQLite database**
 
@@ -505,8 +571,8 @@ afghanpro-website/
 6. **Run migrations and seeders**
 
    ```bash
-   php artisan migrate --seed
-   ```
+php artisan migrate --seed
+```
 
 7. **Link storage (for file uploads)**
 
@@ -523,8 +589,8 @@ afghanpro-website/
    This runs the Laravel server, queue worker, log viewer, and Vite dev server concurrently. Alternatively:
 
    ```bash
-   php artisan serve
-   ```
+php artisan serve
+```
 
 9. **Open the application**
 
