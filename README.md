@@ -1,8 +1,24 @@
 # AfghanPro
 
+[![Live Demo](https://img.shields.io/badge/Live_Demo-afghanpro.ashrafisolutions.com-orange?style=for-the-badge)](https://afghanpro.ashrafisolutions.com)
+
+**Live Site:** [https://afghanpro.ashrafisolutions.com](https://afghanpro.ashrafisolutions.com)
+
 **AfghanPro** is a full-stack financial services and e-learning platform built for users in Afghanistan. It addresses international payment restrictions by combining dual-currency digital wallets, an online shop, course delivery, agency-based cash operations, and HesabPay payment integration — all in a single Laravel application with a Persian RTL interface.
 
 > Portfolio project by [Elmira Ashrafi](https://github.com/elmira-ashrafi)
+
+---
+
+## Screenshots
+
+### Landing Page
+
+![AfghanPro landing page — hero section with remittance and financial services](docs/screenshots/landing-page.png)
+
+### User Dashboard (Mobile)
+
+![AfghanPro mobile dashboard — dual-currency wallets (AFN and USD)](docs/screenshots/dashboard-mobile.png)
 
 ---
 
